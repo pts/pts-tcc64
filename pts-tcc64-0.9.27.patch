@@ -1,0 +1,216 @@
+--- tcc-0.9.27/libtcc.c.orig	2017-12-17 09:27:05.000000000 +0100
++++ tcc-0.9.27/libtcc.c	2022-06-20 14:31:50.260681273 +0200
+@@ -600,11 +600,37 @@
+     tcc_free(bf);
+ }
+ 
++extern char data_crt1[];
++extern char data_crti[];
++extern char data_crtn[];
++extern char data_libtcc1[];
++
++int open_data(char *data)
++{
++    off_t seek_to = (off_t)data;
++    /* This works even if compressed with upx. */
++    int fd = open("/proc/self/mem", O_RDONLY | O_BINARY);
++    if (fd >= 0 && seek_to != lseek(fd, seek_to, SEEK_SET)) {
++        close(fd);
++        return -1;
++    } else {
++        return fd;
++    }
++}
++
+ ST_FUNC int tcc_open(TCCState *s1, const char *filename)
+ {
+     int fd;
+     if (strcmp(filename, "-") == 0)
+         fd = 0, filename = "<stdin>";
++    else if (strcmp(filename, CONFIG_TCC_CRTPREFIX TCC_LIBTCC1 /*"libtcc1.a"*/) == 0)
++        fd = open_data(data_libtcc1);
++    else if (strcmp(filename, CONFIG_TCC_CRTPREFIX "crt1.o") == 0)
++        fd = open_data(data_crt1);
++    else if (strcmp(filename, CONFIG_TCC_CRTPREFIX "crti.o") == 0)
++        fd = open_data(data_crti);
++    else if (strcmp(filename, CONFIG_TCC_CRTPREFIX "crtn.o") == 0)
++        fd = open_data(data_crtn);
+     else
+         fd = open(filename, O_RDONLY | O_BINARY);
+     if ((s1->verbose == 2 && fd >= 0) || s1->verbose == 3)
+@@ -974,9 +1000,12 @@
+     /* add libc crt1/crti objects */
+     if ((output_type == TCC_OUTPUT_EXE || output_type == TCC_OUTPUT_DLL) &&
+         !s->nostdlib) {
+-        if (output_type != TCC_OUTPUT_DLL)
+-            tcc_add_crt(s, "crt1.o");
+-        tcc_add_crt(s, "crti.o");
++        if (output_type != TCC_OUTPUT_DLL) {
++            /*tcc_add_crt(s, "crt1.o");*/
++            tcc_add_file(s, CONFIG_TCC_CRTPREFIX "crt1.o");
++        }
++        /*tcc_add_crt(s, "crti.o");*/
++        tcc_add_file(s, CONFIG_TCC_CRTPREFIX "crti.o");
+     }
+ #endif
+     return 0;
+@@ -1013,10 +1042,13 @@
+     if (flags & AFF_TYPE_BIN) {
+         ElfW(Ehdr) ehdr;
+         int fd, obj_type;
++        off_t old_off;
+ 
+         fd = file->fd;
++        old_off = lseek(fd, 0, SEEK_CUR);
++        if (old_off == (off_t)-1) tcc_error("lseek: %s", filename);
+         obj_type = tcc_object_type(fd, &ehdr);
+-        lseek(fd, 0, SEEK_SET);
++        if (lseek(fd, old_off, SEEK_SET) != old_off) tcc_error("lseek back: %s\n", filename);
+ 
+ #ifdef TCC_TARGET_MACHO
+         if (0 == obj_type && 0 == strcmp(tcc_fileextension(filename), ".dylib"))
+@@ -1025,7 +1057,7 @@
+ 
+         switch (obj_type) {
+         case AFF_BINTYPE_REL:
+-            ret = tcc_load_object_file(s1, fd, 0);
++            ret = tcc_load_object_file(s1, fd, old_off);
+             break;
+ #ifndef TCC_TARGET_PE
+         case AFF_BINTYPE_DYN:
+diff -u -r orig/tcc-0.9.27/tcc.c new/tcc-0.9.27/tcc.c
+--- orig/tcc-0.9.27/tcc.c.orig	2017-12-17 09:27:05.000000000 +0100
++++ tcc-0.9.27/tcc.c	2022-06-20 13:43:12.357180891 +0200
+@@ -141,7 +141,7 @@
+     ;
+ 
+ static const char version[] =
+-    "tcc version "TCC_VERSION" ("
++    "pts-tcc version "TCC_VERSION" ("
+ #ifdef TCC_TARGET_I386
+         "i386"
+ #elif defined TCC_TARGET_X86_64
+diff -u -r orig/tcc-0.9.27/tcc.h new/tcc-0.9.27/tcc.h
+--- tcc-0.9.27/tcc.h.orig	2017-12-17 09:27:05.000000000 +0100
++++ tcc-0.9.27/tcc.h	2022-06-20 14:28:12.648244087 +0200
+@@ -161,6 +161,7 @@
+ #  define TCC_IS_NATIVE
+ # endif
+ #endif
++#undef TCC_IS_NATIVE  /* Disable tcc -run, remove dependency on dlopen etc. */
+ 
+ #if defined TCC_IS_NATIVE && !defined CONFIG_TCCBOOT
+ # define CONFIG_TCC_BACKTRACE
+@@ -190,6 +191,7 @@
+ #endif
+ 
+ /* path to find crt1.o, crti.o and crtn.o */
++#define CONFIG_TCC_CRTPREFIX "///dev/null/crt//"
+ #ifndef CONFIG_TCC_CRTPREFIX
+ # define CONFIG_TCC_CRTPREFIX USE_TRIPLET(CONFIG_SYSROOT "/usr/" CONFIG_LDDIR)
+ #endif
+@@ -1422,7 +1424,7 @@
+ ST_FUNC void relocate_section(TCCState *s1, Section *s);
+ 
+ ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) *h);
+-ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset);
++ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, off_t file_offset);
+ ST_FUNC int tcc_load_archive(TCCState *s1, int fd);
+ ST_FUNC void tcc_add_bcheck(TCCState *s1);
+ ST_FUNC void tcc_add_runtime(TCCState *s1);
+diff -u -r orig/tcc-0.9.27/tccelf.c new/tcc-0.9.27/tccelf.c
+--- tcc-0.9.27/tccelf.c.orig	2017-12-17 09:27:05.000000000 +0100
++++ tcc-0.9.27/tccelf.c	2022-06-20 14:33:45.094874186 +0200
+@@ -1146,12 +1146,14 @@
+ }
+ #endif
+ 
++#if 0
+ static int tcc_add_support(TCCState *s1, const char *filename)
+ {
+     char buf[1024];
+     snprintf(buf, sizeof(buf), "%s/%s", s1->tcc_lib_path, filename);
+     return tcc_add_file(s1, buf);
+ }
++#endif
+ 
+ ST_FUNC void tcc_add_bcheck(TCCState *s1)
+ {
+@@ -1200,10 +1202,13 @@
+                 tcc_add_dll(s1, TCC_LIBGCC, 0);
+         }
+ #endif
+-        tcc_add_support(s1, TCC_LIBTCC1);
++        /*tcc_add_support(s1, TCC_LIBTCC1);*/
++        tcc_add_file(s1, CONFIG_TCC_CRTPREFIX TCC_LIBTCC1 /*"libtcc1.a"*/);
+         /* add crt end if not memory output */
+-        if (s1->output_type != TCC_OUTPUT_MEMORY)
+-            tcc_add_crt(s1, "crtn.o");
++        if (s1->output_type != TCC_OUTPUT_MEMORY) {
++            /*tcc_add_crt(s1, "crtn.o");*/
++            tcc_add_file(s1, CONFIG_TCC_CRTPREFIX "crtn.o");
++        }
+     }
+ }
+ 
+@@ -2281,7 +2286,7 @@
+ /* load an object file and merge it with current files */
+ /* XXX: handle correctly stab (debug) info */
+ ST_FUNC int tcc_load_object_file(TCCState *s1,
+-                                int fd, unsigned long file_offset)
++                                int fd, off_t file_offset)
+ {
+     ElfW(Ehdr) ehdr;
+     ElfW(Shdr) *shdr, *sh;
+@@ -2299,7 +2304,10 @@
+ 
+     stab_index = stabstr_index = 0;
+ 
+-    lseek(fd, file_offset, SEEK_SET);
++    if (lseek(fd, file_offset, SEEK_SET) != file_offset) {
++        tcc_error_noabort("error seeking in object file");
++        return -1;
++    }
+     if (tcc_object_type(fd, &ehdr) != AFF_BINTYPE_REL)
+         goto fail1;
+     /* test CPU specific stuff */
+@@ -2590,7 +2598,7 @@
+ }
+ 
+ /* load only the objects which resolve undefined symbols */
+-static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
++static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize, off_t base_off)
+ {
+     long i, bound, nsyms, sym_index, off, ret;
+     uint8_t *data;
+@@ -2612,7 +2620,7 @@
+             if(sym_index) {
+                 sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
+                 if(sym->st_shndx == SHN_UNDEF) {
+-                    off = (entrysize == 4
++                    off = base_off + (entrysize == 4
+ 			   ? get_be32(ar_index + i * 4)
+ 			   : get_be64(ar_index + i * 8))
+ 			  + sizeof(ArchiveHeader);
+@@ -2657,6 +2665,8 @@
+         ar_size[sizeof(hdr.ar_size)] = '\0';
+         size = strtol(ar_size, NULL, 0);
+         memcpy(ar_name, hdr.ar_name, sizeof(hdr.ar_name));
++        if (hdr.ar_name[0] == '\001' && hdr.ar_name[1] == '\000') 
++            break;  /* end of libtcc1.a */
+         for(i = sizeof(hdr.ar_name) - 1; i >= 0; i--) {
+             if (ar_name[i] != ' ')
+                 break;
+@@ -2668,10 +2678,10 @@
+         if (!strcmp(ar_name, "/")) {
+             /* coff symbol table : we handle it */
+             if(s1->alacarte_link)
+-                return tcc_load_alacarte(s1, fd, size, 4);
++                return tcc_load_alacarte(s1, fd, size, 4, file_offset - sizeof(hdr) - sizeof(magic));
+ 	} else if (!strcmp(ar_name, "/SYM64/")) {
+             if(s1->alacarte_link)
+-                return tcc_load_alacarte(s1, fd, size, 8);
++                return tcc_load_alacarte(s1, fd, size, 8, file_offset - sizeof(hdr) - sizeof(magic));
+         } else {
+             ElfW(Ehdr) ehdr;
+             if (tcc_object_type(fd, &ehdr) == AFF_BINTYPE_REL) {
